@@ -53,6 +53,7 @@ class DualPipe(nn.Module):
         self.output_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
         self.labels: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = None
         self.loss_chunks: List[torch.Tensor] = []
+        self.forward_outputs_list: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
         self.criterion: Callable = None
 
         self.current_f_chunk_id: List[int] = [0, 0]
@@ -74,7 +75,9 @@ class DualPipe(nn.Module):
 
         is_last_stage = (self.is_first_rank and phase == 1) or (self.is_last_rank and phase == 0)
 
-        outputs = self.module[phase](*inputs)
+        self.forward_outputs_list[phase].append([])
+        outputs_list = self.forward_outputs_list[phase][chunk_id]
+        outputs = self.module[phase](*inputs, outputs_list)
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage and self.criterion is not None:
             labels = self.labels[phase][chunk_id]
@@ -109,6 +112,13 @@ class DualPipe(nn.Module):
             outputs, output_grads = list(zip(*non_empty))
             if len(outputs) > 0:
                 run_backward(outputs, output_grads)
+
+        outputs_list = self.forward_outputs_list[phase][chunk_id]
+        self.forward_outputs_list[phase][chunk_id] = None
+        while len(outputs_list) > 0:
+            output_grads = [t.grad for t in outputs_list.pop()]
+            outputs = outputs_list.pop()
+            run_backward(tuple(outputs), tuple(output_grads))
         WeightGradStore.enabled = False
         if enable_zb:
             WeightGradStore.flush()
@@ -142,6 +152,8 @@ class DualPipe(nn.Module):
         else:
             labels0 = []
             criterion0 = None
+        self.forward_outputs_list[phase0].append([])
+        outputs_list0 = self.forward_outputs_list[phase0][chunk_id0]
 
         # pre-backward
         phase1 ^= self.is_in_second_half
@@ -163,11 +175,12 @@ class DualPipe(nn.Module):
             self.output_grad_chunks[phase1][chunk_id1] = None
             non_empty = [(t, g) for t, g in zip(outputs1, output_grads1) if g is not None]
             outputs1, output_grads1 = list(zip(*non_empty))
+        outputs_list1 = self.forward_outputs_list[phase1][chunk_id1]
 
         # forward & backward
         outputs0, loss0 = type(module0).overlaped_forward_backward(
-            module0, inputs0, criterion0, labels0,
-            module1, loss1, outputs1, output_grads1,
+            module0, inputs0, criterion0, labels0, outputs_list0,
+            module1, loss1, outputs1, output_grads1, outputs_list1,
         )
 
         # post-forward
@@ -355,11 +368,13 @@ class DualPipe(nn.Module):
         # For the fisrt half of the ranks: phase 0 means forward direction, phase 1 means reverse direction.
         # For the second half of the ranks: phase 0 means reverse direction, phase 1 means forward direction.
 
+        print('------------ stage1')
         # Step 1: nF0
         step_1 = (num_half_ranks - half_rank - 1) * 2
         for i in range(step_1):
             self._forward_chunk(0)
 
+        print('------------ stage2')
         # Step 2: nF0F1
         step_2 = half_rank + 1
         self._recv_forward(0)
@@ -370,6 +385,7 @@ class DualPipe(nn.Module):
             if not self.is_middle_rank:
                 self._send_forward(0)
 
+        print('------------ stage3')
         # Step 3: nB1W1F1 (Use zero bubble)
         step_3 = num_half_ranks - half_rank - 1
         for i in range(step_3):
@@ -378,6 +394,7 @@ class DualPipe(nn.Module):
             self._weight_chunk()
             self._forward_chunk(1, recv=False)
 
+        print('------------ stage4')
         # Step 4 (Main step): nF0B1F1B0
         step_4 = half_num_chunks - num_ranks + half_rank + 1
         for i in range(step_4):
@@ -395,12 +412,14 @@ class DualPipe(nn.Module):
                 self._forward_backward_chunk(0, 1)
             self._forward_backward_chunk(1, 0)
 
+        print('------------ stage5')
         # Step 5: nB1F1B0
         step_5 = num_half_ranks - half_rank - 1
         for i in range(step_5):
             self._backward_chunk(1)
             self._forward_backward_chunk(1, 0)
 
+        print('------------ stage6')
         # Step 6: nB1B0 (The second half of the chunks use zero bubble)
         step_6 = half_rank + 1
         enable_zb = False
@@ -412,12 +431,14 @@ class DualPipe(nn.Module):
                 enable_zb = True
             self._backward_chunk(0, enable_zb=enable_zb)
 
+        print('------------ stage7')
         # Step 7: nWB0 (Use zero bubble)
         step_7 = num_half_ranks - half_rank - 1
         for i in range(step_7):
             self._weight_chunk()
             self._backward_chunk(0, enable_zb=True)
 
+        print('------------ stage8')
         # Step 8: nW
         step_8 = half_rank + 1
         for i in range(step_8):
@@ -425,6 +446,7 @@ class DualPipe(nn.Module):
         assert WeightGradStore.funcs_queue.empty()
 
         self._commit_and_wait_comm()
+        print('------------ end')
 
         loss, outputs = None, None
         if self.is_first_rank or self.is_last_rank:
